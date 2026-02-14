@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+ENV/
+
+# Videos (temporary)
+videos/*.mp4
+videos/*.m4a
+videos/*.part
+videos/*.webm
+
+# Output
+output/*.txt
+
+# Config (may contain API keys)
+config.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
