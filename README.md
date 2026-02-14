@@ -82,7 +82,6 @@ streamlit run video_caption_app.py
 ## 支持平台
 
 - 抖音
-- 小红书
-- B站
-- 微博
+- 小红书（暂未支持）
+- B站（暂未支持）
 - 或直接提供视频 URL
