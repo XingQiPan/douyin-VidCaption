@@ -156,6 +156,178 @@ def load_whisper_model(model_size="base"):
     return whisper.load_model(model_size)
 
 
+# ==================== B站字幕提取 ====================
+MIXIN_KEY_ENC_TAB = [
+    46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35,
+    27, 43, 5, 49, 33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13,
+    37, 48, 7, 16, 24, 55, 40, 61, 26, 17, 0, 1, 60, 51, 30, 4,
+    22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11, 36, 20, 34, 44, 52
+]
+
+
+def get_mixin_key(orig: str) -> str:
+    """生成WBI签名用的mixin key"""
+    return ''.join(orig[i] for i in MIXIN_KEY_ENC_TAB)[:32]
+
+
+def sign_wbi(params: dict, img_key: str, sub_key: str) -> dict:
+    """对请求参数进行WBI签名"""
+    import time
+    import urllib.parse
+    import hashlib
+
+    mixin_key = get_mixin_key(img_key + sub_key)
+    params['wts'] = round(time.time())
+    params = {
+        k: ''.join(c for c in str(v) if c not in "!'()*")
+        for k, v in sorted(params.items())
+    }
+    query = urllib.parse.urlencode(params)
+    params['w_rid'] = hashlib.md5(f'{query}{mixin_key}'.encode()).hexdigest()
+    return params
+
+
+def get_wbi_keys() -> tuple:
+    """获取WBI签名密钥 (img_key, sub_key)"""
+    import requests
+
+    resp = requests.get('https://api.bilibili.com/x/web-interface/nav', timeout=10)
+    data = resp.json().get('data', {}).get('wbi_img', {})
+    img_url = data.get('img_url', '')
+    sub_url = data.get('sub_url', '')
+    img_key = img_url.split('/')[-1].split('.')[0]
+    sub_key = sub_url.split('/')[-1].split('.')[0]
+    return img_key, sub_key
+
+
+def extract_bilibili_subtitle(url: str, sessdata: str = "") -> Optional[Dict[str, Any]]:
+    """从B站视频提取字幕文本，返回字幕信息或None"""
+    import requests
+
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Referer': 'https://www.bilibili.com',
+    }
+    if sessdata:
+        headers['Cookie'] = f'SESSDATA={sessdata}'
+
+    # 处理b23.tv短链接
+    if 'b23.tv' in url:
+        try:
+            resp = requests.get(url, headers=headers, allow_redirects=True, timeout=10)
+            url = resp.url
+        except:
+            pass
+
+    # 解析BV号
+    bv_match = re.search(r'(BV[\w]+)', url)
+    if not bv_match:
+        return None
+    bvid = bv_match.group(1)
+
+    # 解析多P参数
+    page = 1
+    p_match = re.search(r'[?&]p=(\d+)', url)
+    if p_match:
+        page = int(p_match.group(1))
+
+    st.info(f"正在获取B站视频信息... BV号={bvid}")
+
+    # 获取视频信息
+    try:
+        info_resp = requests.get(
+            'https://api.bilibili.com/x/web-interface/view',
+            params={'bvid': bvid}, headers=headers, timeout=10
+        )
+        info_data = info_resp.json()
+        if info_data.get('code') != 0:
+            st.warning(f"获取视频信息失败: {info_data.get('message', '')}")
+            return None
+
+        video_info = info_data['data']
+        title = video_info.get('title', '')
+        st.info(f"视频标题: {title}")
+
+        pages = video_info.get('pages', [])
+        if pages:
+            cid = None
+            for p in pages:
+                if p.get('page') == page:
+                    cid = p.get('cid')
+                    break
+            if cid is None:
+                cid = pages[0].get('cid')
+        else:
+            cid = video_info.get('cid')
+    except Exception as e:
+        st.warning(f"获取视频信息失败: {e}")
+        return None
+
+    if not cid:
+        return None
+
+    # 获取WBI密钥并签名请求字幕
+    try:
+        img_key, sub_key = get_wbi_keys()
+        params = sign_wbi({'bvid': bvid, 'cid': cid}, img_key, sub_key)
+
+        subtitle_resp = requests.get(
+            'https://api.bilibili.com/x/player/wbi/v2',
+            params=params, headers=headers, timeout=10
+        )
+        subtitle_data = subtitle_resp.json()
+    except Exception as e:
+        st.warning(f"获取字幕信息失败: {e}")
+        return None
+
+    subtitles = subtitle_data.get('data', {}).get('subtitle', {}).get('subtitles', [])
+
+    if not subtitles:
+        st.info("该视频无CC/AI字幕，将使用语音识别模式")
+        return None
+
+    # 优先选中文
+    target = None
+    for sub in subtitles:
+        if sub.get('lan', '').startswith('zh'):
+            target = sub
+            break
+    if not target:
+        target = subtitles[0]
+
+    subtitle_url = target.get('subtitle_url', '')
+    if subtitle_url.startswith('//'):
+        subtitle_url = 'https:' + subtitle_url
+
+    # 下载字幕
+    try:
+        sub_resp = requests.get(subtitle_url, headers=headers, timeout=10)
+        sub_json = sub_resp.json()
+    except Exception as e:
+        st.warning(f"下载字幕失败: {e}")
+        return None
+
+    body = sub_json.get('body', [])
+    if not body:
+        return None
+
+    full_text = '\n'.join(item.get('content', '') for item in body)
+    segments = [{
+        'start': item.get('from', 0),
+        'end': item.get('to', 0),
+        'text': item.get('content', '')
+    } for item in body]
+
+    st.success(f"成功提取B站字幕，共 {len(body)} 条")
+    return {
+        "success": True,
+        "text": full_text,
+        "segments": segments,
+        "title": title,
+        "source": "bilibili_subtitle"
+    }
+
+
 def extract_video_url(video_input: str) -> Optional[str]:
     """从链接提取视频下载URL"""
     import requests
@@ -255,7 +427,7 @@ def extract_video_url(video_input: str) -> Optional[str]:
         return None
 
 
-def download_video_with_ytdlp(url: str, output_path: str) -> bool:
+def download_video_with_ytdlp(url: str, output_path: str, audio_only: bool = False) -> bool:
     """使用yt-dlp下载视频"""
     try:
         import yt_dlp
@@ -264,26 +436,34 @@ def download_video_with_ytdlp(url: str, output_path: str) -> bool:
         output_dir = os.path.dirname(output_path)
         base_name = os.path.basename(output_path).replace('.mp4', '')
 
+        if audio_only:
+            fmt = 'bestaudio/best'
+        else:
+            fmt = 'best[ext=mp4]/best'
+
         ydl_opts = {
             'outtmpl': os.path.join(output_dir, base_name),
-            'format': 'best[ext=mp4]/best',
+            'format': fmt,
             'quiet': True,
             'no_warnings': True,
             'extract_audio': False,
             'noplaylist': True,
+            'merge_output_format': 'mp4',
         }
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
 
-        # 查找下载的文件并重命名为.mp4
+        # 查找下载的文件
         pattern = os.path.join(output_dir, base_name + '*')
         files = glob.glob(pattern)
         for f in files:
-            if not f.endswith('.mp4') and not f.endswith('.part'):
+            if f.endswith('.part'):
+                continue
+            if not f.endswith(('.mp4', '.m4a', '.webm', '.mkv', '.mp3', '.ogg', '.wav')):
                 os.rename(f, f + '.mp4')
                 return True
-            elif f.endswith('.mp4'):
+            else:
                 return True
 
         return False
@@ -552,6 +732,8 @@ def save_caption(result: Dict[str, Any], output_dir: Path, index: int, use_llm: 
     # 确定文件名
     if use_llm and result.get("cleaned_title"):
         title = result["cleaned_title"]
+    elif result.get("bilibili_title"):
+        title = result["bilibili_title"]
     elif result.get("transcript"):
         title = extract_title_from_text(result["transcript"])
     else:
@@ -602,7 +784,8 @@ def cleanup_video_files():
 
 def process_video(video_input: str, model_size: str, use_llm: bool,
                   api_key: str, api_base: str, llm_model: str,
-                  clean_prompt: str, progress_callback=None) -> Dict[str, Any]:
+                  clean_prompt: str, progress_callback=None,
+                  bilibili_sessdata: str = "") -> Dict[str, Any]:
     """处理单个视频"""
     result = {
         "input": video_input,
@@ -616,8 +799,52 @@ def process_video(video_input: str, model_size: str, use_llm: bool,
     try:
         # 判断是URL还是本地文件
         is_url = video_input.startswith('http://') or video_input.startswith('https://')
+        is_bilibili = is_url and ('bilibili.com' in video_input or 'b23.tv' in video_input)
 
-        if is_url:
+        if is_bilibili:
+            # ===== B站视频处理 =====
+            if progress_callback:
+                progress_callback(0.1, "正在提取B站字幕...")
+
+            subtitle_result = extract_bilibili_subtitle(video_input, bilibili_sessdata)
+
+            if subtitle_result and subtitle_result.get("success"):
+                result["transcript"] = subtitle_result["text"]
+                result["segments"] = subtitle_result["segments"]
+                result["success"] = True
+                result["source"] = "bilibili_subtitle"
+                if subtitle_result.get("title"):
+                    result["bilibili_title"] = subtitle_result["title"]
+
+                if progress_callback:
+                    progress_callback(0.7, "B站字幕提取成功")
+            else:
+                # 回退到yt-dlp下载 + Whisper
+                if progress_callback:
+                    progress_callback(0.2, "正在通过yt-dlp下载B站视频...")
+
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                video_path = VIDEOS_DIR / f"{timestamp}.mp4"
+                is_temp_video = True
+
+                if download_video_with_ytdlp(video_input, str(video_path), audio_only=True):
+                    if progress_callback:
+                        progress_callback(0.5, "下载完成，正在进行语音识别...")
+
+                    transcript_result = transcribe_video(str(video_path), model_size)
+                    if transcript_result["success"]:
+                        result["transcript"] = transcript_result["text"]
+                        result["segments"] = transcript_result["segments"]
+                        result["success"] = True
+                        result["source"] = "whisper"
+                    else:
+                        result["error"] = transcript_result.get("error", "语音识别失败")
+                        return result
+                else:
+                    result["error"] = "B站视频下载失败，请检查yt-dlp是否安装且为最新版本"
+                    return result
+
+        elif is_url:
             # 检查是否是抖音链接，使用Selenium下载
             if 'douyin.com' in video_input or 'v.douyin.com' in video_input:
                 if progress_callback:
@@ -672,26 +899,27 @@ def process_video(video_input: str, model_size: str, use_llm: bool,
                 result["error"] = f"文件不存在: {video_input}"
                 return result
 
-        if progress_callback:
-            progress_callback(0.5, "正在进行语音识别...")
+        # 需要语音识别的情况（非B站字幕提取成功的）
+        if not result["success"] and video_path:
+            if progress_callback:
+                progress_callback(0.5, "正在进行语音识别...")
 
-        # 语音识别
-        transcript_result = transcribe_video(str(video_path), model_size)
+            transcript_result = transcribe_video(str(video_path), model_size)
 
-        if not transcript_result["success"]:
-            result["error"] = transcript_result.get("error", "语音识别失败")
-            return result
+            if not transcript_result["success"]:
+                result["error"] = transcript_result.get("error", "语音识别失败")
+                return result
 
-        result["transcript"] = transcript_result["text"]
-        result["segments"] = transcript_result["segments"]
-        result["success"] = True
+            result["transcript"] = transcript_result["text"]
+            result["segments"] = transcript_result["segments"]
+            result["success"] = True
 
         # LLM清理
         if use_llm and api_key:
             if progress_callback:
                 progress_callback(0.8, "正在进行LLM清理...")
             llm_result = clean_with_llm(
-                transcript_result["text"], api_key, api_base, llm_model, clean_prompt
+                result["transcript"], api_key, api_base, llm_model, clean_prompt
             )
             result["cleaned"] = llm_result["text"]
             if llm_result.get("title"):
@@ -758,6 +986,17 @@ def main():
 
         st.markdown("---")
 
+        # B站配置
+        st.subheader("📺 B站设置")
+        bilibili_sessdata = st.text_input(
+            "SESSDATA (可选)",
+            value=saved_config.get("bilibili_sessdata", ""),
+            type="password",
+            help="B站登录Cookie中的SESSDATA，用于获取需要登录的字幕。留空则使用未登录模式。"
+        )
+
+        st.markdown("---")
+
         # LLM配置
         st.subheader("🤖 LLM清理")
         use_llm = st.checkbox("启用LLM清理", value=saved_config.get("use_llm", False))
@@ -781,7 +1020,8 @@ def main():
                     "model_size": model_size,
                     "use_llm": use_llm,
                     "auto_save": auto_save,
-                    "clean_prompt": clean_prompt
+                    "clean_prompt": clean_prompt,
+                    "bilibili_sessdata": bilibili_sessdata
                 }
                 if save_config(new_config):
                     st.success("✅ 配置已保存！")
@@ -894,7 +1134,8 @@ def main():
                 result = process_video(
                     video_input, model_size, use_llm,
                     api_key, api_base, llm_model, clean_prompt,
-                    update_progress
+                    update_progress,
+                    bilibili_sessdata=bilibili_sessdata
                 )
                 result["index"] = i + 1
                 all_results.append(result)
